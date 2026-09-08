@@ -1,0 +1,140 @@
+name: "RDP Fabric Pro"
+
+# V9 — post-cycles rebuild. No GH_PAT, no actions:write, no self-dispatch.
+# Single-shot session: job timeout is derived from runtime_minutes in the
+# orchestrate job, so the overlay deadline and the GitHub kill time agree.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_image:
+        description: "Runner label (windows-latest = 4c/16GB)"
+        required: false
+        default: "windows-latest"
+      instance_count:
+        description: "Parallel nodes (keep low on public runners)"
+        required: false
+        default: "1"
+        type: choice
+        options: ["1", "2", "3"]
+      runtime_minutes:
+        description: "Session duration in minutes (max 345)"
+        required: true
+        default: "345"
+      workload_profile:
+        description: "Adaptive tuning profile (compute refused below 8t/24GB)"
+        required: false
+        default: "auto"
+        type: choice
+        options: [auto, interactive, memory, network]
+      quick_test:
+        description: "Run 5-minute smoke test"
+        type: boolean
+        default: false
+      rdp_compression:
+        description: "RDP wire compression: auto = off on direct path, on when relayed"
+        required: false
+        default: "auto"
+        type: choice
+        options: [auto, on, off]
+      reclaim_disk:
+        description: "Reclaim temp caches so payloads fit"
+        type: boolean
+        default: true
+      enable_ramdisk:
+        description: "Ignored unless node has >= 28 GB RAM"
+        type: boolean
+        default: false
+      startup_url:
+        description: "Optional URL to open at logon (empty = none)"
+        required: false
+        default: ""
+      notify:
+        description: "Send Telegram online/failure pings"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  orchestrate:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+      timeout: ${{ steps.set.outputs.timeout }}
+    steps:
+      - id: set
+        shell: bash
+        run: |
+          count=${{ inputs.instance_count }}
+          runtime=${{ inputs.runtime_minutes }}
+          if [ "${{ inputs.quick_test }}" = "true" ]; then runtime=5; fi
+          timeout=$((runtime + 15))
+          if [ "$timeout" -gt 360 ]; then timeout=360; fi
+          ids=$(seq 1 "$count" | jq -R . | jq -s -c .)
+          echo "matrix={\"id\":$ids}" >> "$GITHUB_OUTPUT"
+          echo "timeout=$timeout" >> "$GITHUB_OUTPUT"
+          echo "Orchestrating $count node(s), job timeout ${timeout}m."
+
+  fabric:
+    needs: orchestrate
+    runs-on: ${{ inputs.runner_image }}
+    timeout-minutes: ${{ fromJSON(needs.orchestrate.outputs.timeout) }}
+    strategy:
+      matrix: ${{ fromJson(needs.orchestrate.outputs.matrix) }}
+      max-parallel: 3
+      fail-fast: false
+    env:
+      TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      RDP_PASS: ${{ secrets.RDP_PASSWORD }}
+      TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+      RDP_USER: FabricAdmin
+      FABRIC_ROOT: C:\ProgramData\RDPFabric
+      MATRIX_ID: ${{ matrix.id }}
+      RUN_ID: ${{ github.run_id }}
+      # Input passthrough — engine resolves env first, then -Param, then default.
+      FAB_RUNNER_IMAGE: ${{ inputs.runner_image }}
+      FAB_INSTANCE_COUNT: ${{ inputs.instance_count }}
+      FAB_RUNTIME: ${{ inputs.runtime_minutes }}
+      FAB_PROFILE_INPUT: ${{ inputs.workload_profile }}
+      FAB_QUICKTEST: ${{ inputs.quick_test }}
+      FAB_RAMDISK: ${{ inputs.enable_ramdisk }}
+      FAB_RDPCOMP: ${{ inputs.rdp_compression }}
+      FAB_RECLAIM: ${{ inputs.reclaim_disk }}
+      FAB_STARTUP_URL: ${{ inputs.startup_url }}
+      FAB_NOTIFY: ${{ inputs.notify }}
+      # FAB_TS_VERSION / FAB_TS_SHA256: optional Tailscale pin overrides.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fabric engine
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File .github/scripts/Fabric.ps1 `
+            -Mode full `
+            -WorkloadProfile "${{ inputs.workload_profile }}" `
+            -RdpCompression "${{ inputs.rdp_compression }}" `
+            -QuickTest "${{ inputs.quick_test }}" `
+            -EnableRamdisk "${{ inputs.enable_ramdisk }}" `
+            -ReclaimDisk "${{ inputs.reclaim_disk }}" `
+            -StartupUrl "${{ inputs.startup_url }}" `
+            -Notify "${{ inputs.notify }}"
+
+      - name: Teardown
+        if: always()
+        shell: pwsh
+        run: pwsh -NoProfile -File .github/scripts/teardown.ps1
+
+      - name: Failure alert
+        if: failure()
+        shell: pwsh
+        run: |
+          if ($env:FAB_NOTIFY -notmatch '^(?i)true$') { exit 0 }
+          if (-not $env:TG_TOKEN -or -not $env:TG_CHAT) { exit 0 }
+          $st = $null
+          try { $st = Get-Content "C:\ProgramData\RDPFabric\state.json" -Raw | ConvertFrom-Json } catch {}
+          $msg = "❌ <b>Fabric Node FAILED</b>`n🖥 <code>$($st.host)</code>`n🌐 <code>$($st.ip)</code>`n🧠 <code>$($st.profile)</code>`n👤 <code>$($st.user)</code>`n⏳ <code>$($st.minutes_left)</code> min left"
+          try { Invoke-RestMethod "https://api.telegram.org/bot$($env:TG_TOKEN)/sendMessage" -Method Post -Body @{chat_id=$env:TG_CHAT; text=$msg; parse_mode='HTML'} -TimeoutSec 15 | Out-Null } catch {}
