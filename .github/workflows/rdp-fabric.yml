@@ -108,7 +108,7 @@ jobs:
       # FAB_TS_VERSION / FAB_TS_SHA256: optional Tailscale pin overrides.
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Fabric engine
         shell: pwsh
