@@ -1,8 +1,9 @@
 name: "RDP Fabric Pro"
 
-# V9 — post-cycles rebuild. No GH_PAT, no actions:write, no self-dispatch.
-# Single-shot session: job timeout is derived from runtime_minutes in the
-# orchestrate job, so the overlay deadline and the GitHub kill time agree.
+# V9.1 — post-cycles rebuild + Azure NIC/TCP stack (Phase 2.1).
+# No GH_PAT, no actions:write, no self-dispatch. Single-shot session.
+# checkout@v5 (Node 24). Tailscale pin overridable via repo Variables
+# FAB_TS_VERSION / FAB_TS_SHA256.
 
 on:
   workflow_dispatch:
@@ -22,7 +23,7 @@ on:
         required: true
         default: "345"
       workload_profile:
-        description: "Adaptive tuning profile (compute refused below 8t/24GB)"
+        description: "Adaptive tuning profile (network = interactive + Phase 2.1)"
         required: false
         default: "auto"
         type: choice
@@ -105,7 +106,9 @@ jobs:
       FAB_RECLAIM: ${{ inputs.reclaim_disk }}
       FAB_STARTUP_URL: ${{ inputs.startup_url }}
       FAB_NOTIFY: ${{ inputs.notify }}
-      # FAB_TS_VERSION / FAB_TS_SHA256: optional Tailscale pin overrides.
+      # Optional Tailscale pin overrides (repo Variables, not secrets).
+      FAB_TS_VERSION: ${{ vars.FAB_TS_VERSION }}
+      FAB_TS_SHA256: ${{ vars.FAB_TS_SHA256 }}
 
     steps:
       - uses: actions/checkout@v5
