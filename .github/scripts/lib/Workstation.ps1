@@ -1,5 +1,7 @@
 # lib/Workstation.ps1 — Phase 2.7 (workstation mode) + Phase 2.8 (session UX).
 # Both best-effort, full only.
+# v9.1: S3 — the logon task carries -SoftwareGpu when the node has no real GPU
+# (UserLogon then sets WARP/software-GL env and launches Edge with GPU off).
 
 function Invoke-FabricWorkstation {
     param([pscustomobject]$Cfg)
@@ -72,9 +74,12 @@ function Register-FabricSessionUx {
     $deadlineFile = Join-Path $Cfg.FabricRoot 'deadline.txt'
 
     # One task, one path: AtLogOn as the RDP user, 5s delay, elevated (the
-    # logon script also does the one-time service nudge).
+    # logon script also does the one-time service nudge). This is a raw task
+    # command line (Task Scheduler parses it) — quoted paths are correct here.
     $arg = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$userLogon`" -DeadlineFile `"$deadlineFile`" -FallbackMinutes $($Cfg.RuntimeMinutes)"
     if ($Cfg.StartupUrl) { $arg += " -StartupUrl `"$($Cfg.StartupUrl)`"" }
+    # S3: software rendering flag for GPU-less RDP sessions.
+    if (-not $Cfg.HasRealGpu) { $arg += ' -SoftwareGpu' }
 
     $act   = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arg
     $trg   = New-ScheduledTaskTrigger -AtLogOn -User $taskUser
@@ -101,5 +106,6 @@ function Register-FabricSessionUx {
         }
     }
 
-    Write-FabricLog $Cfg ("Session UX armed: RDPFabric-Session AtLogOn as {0} (timer{1})." -f $Cfg.User, $(if ($Cfg.StartupUrl) {' + Edge'} else {' only'}))
+    Write-FabricLog $Cfg ("Session UX armed: RDPFabric-Session AtLogOn as {0} (timer{1}{2})." -f `
+        $Cfg.User, $(if ($Cfg.StartupUrl) {' + Edge'} else {' only'}), $(if (-not $Cfg.HasRealGpu) {' + software-GL'} else {''}))
 }
