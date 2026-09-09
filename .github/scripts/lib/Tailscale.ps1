@@ -1,6 +1,8 @@
 # lib/Tailscale.ps1 — Phase 2 (fatal).
-# Pinned MSI (process-handle async fetch + hash option), install, up, verify,
-# MTU, direct/DERP-aware RDP compression, state merge, optional notify.
+# v9.1: M1 (Start-Process ArgumentList arrays take raw paths), S8 (--reset
+# only on github-hosted), S2 (honest path detection: Self.Relay proves DERP,
+# an active peer with CurAddr proves direct — otherwise 'unknown', and
+# compression stays on until direct is proven).
 
 function Invoke-FabricTailscale {
     param([pscustomobject]$Cfg)
@@ -34,21 +36,21 @@ function Invoke-FabricTailscale {
         if (-not $ok) { throw "Tailscale MSI download failed ($($Cfg.TsMsiUrl))." }
     }
 
-    # ── optional integrity check ──
+    # ── optional integrity check (repo variable FAB_TS_SHA256) ──
     if ($Cfg.TsSha256) {
         $h = (Get-FileHash -LiteralPath $msi -Algorithm SHA256).Hash
         if ($h -ne $Cfg.TsSha256.ToUpperInvariant()) { throw "Tailscale MSI SHA256 mismatch." }
         Write-FabricLog $Cfg "MSI SHA256 verified."
     } else {
-        Write-FabricLog $Cfg "Version pinned to $($Cfg.TsVersion); set FAB_TS_SHA256 to also enforce a hash."
+        Write-FabricLog $Cfg "Version pinned to $($Cfg.TsVersion); set repo variable FAB_TS_SHA256 to enforce a hash."
     }
 
-    # ── install (0/1641/3010 = binary should exist) ──
-    $p = Start-Process msiexec.exe -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -PassThru -Wait
+    # ── install (0/1641/3010 = binary should exist). M1: raw paths in arrays. ──
+    $p = Start-Process msiexec.exe -ArgumentList @('/i', $msi, '/qn', '/norestart') -PassThru -Wait
     if ($p.ExitCode -notin 0, 1641, 3010) {
         Write-FabricLog $Cfg "msiexec exit $($p.ExitCode) — retrying once."
         Start-Sleep -Seconds 5
-        $p = Start-Process msiexec.exe -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -PassThru -Wait
+        $p = Start-Process msiexec.exe -ArgumentList @('/i', $msi, '/qn', '/norestart') -PassThru -Wait
     }
     if (-not (Test-Path -LiteralPath $Cfg.TsExe)) { throw "Tailscale installation failed (msiexec exit $($p.ExitCode))." }
 
@@ -57,7 +59,11 @@ function Invoke-FabricTailscale {
     $hn = (($parts -join '-') -replace '[^a-zA-Z0-9-]', '-').Trim('-').ToLowerInvariant()
     if ($hn.Length -gt 60) { $hn = $hn.Substring(0, 60).Trim('-') }
     $Cfg.TsHostname = $hn
-    & $Cfg.TsExe up --authkey="$env:TS_AUTHKEY" --hostname="$($Cfg.TsHostname)" --accept-routes=false --accept-dns=false --unattended --reset
+    # S8: --reset only on hosted runners — a self-hosted node keeps its identity.
+    $up = @('up', "--authkey=$env:TS_AUTHKEY", "--hostname=$($Cfg.TsHostname)",
+            '--accept-routes=false', '--accept-dns=false', '--unattended')
+    if ($env:RUNNER_ENVIRONMENT -eq 'github-hosted') { $up += '--reset' }
+    & $Cfg.TsExe @up
 
     $backend = $null
     for ($i = 0; $i -lt 40; $i++) {
@@ -75,14 +81,21 @@ function Invoke-FabricTailscale {
     if ($ip -notmatch '^\d{1,3}(\.\d{1,3}){3}$') { throw "Failed to acquire a Tailscale IPv4." }
     $Cfg.TsIp = $ip
 
-    # ── direct vs DERP (authoritative JSON, text fallback) ──
+    # ── S2: honest path detection. At provision time no peer is connected yet,
+    # so the honest answer is usually 'unknown' — compression stays ON until a
+    # direct peer path is proven (safe default for DERP, minor cost if direct).
     $Cfg.TsDirect = $false
+    $pathLabel = 'unknown'
     $j = $null
     try { $j = (& $Cfg.TsExe status --json 2>$null | ConvertFrom-Json) } catch {}
     if ($j -and $j.Self) {
-        $Cfg.TsDirect = ([string]$j.Self.Relay -eq '' -and [string]$j.Self.CurAddr -ne '')
-    } else {
-        $Cfg.TsDirect = ((& $Cfg.TsExe status 2>$null | Out-String) -notmatch 'relay')
+        if ([string]$j.Self.Relay -ne '') {
+            $pathLabel = 'DERP relay'
+        } else {
+            $peers = @($j.Peer.PSObject.Properties.Value)
+            $directPeer = @($peers | Where-Object { $_.Active -and $_.CurAddr -and -not $_.Relay })
+            if ($directPeer.Count -gt 0) { $Cfg.TsDirect = $true; $pathLabel = 'direct' }
+        }
     }
 
     # ── the TCP knobs that actually matter on this path: MTU + no-delay ──
@@ -101,7 +114,7 @@ function Invoke-FabricTailscale {
         }
     }
 
-    # ── compression: auto = off on direct, on over DERP ──
+    # ── compression: auto = off only when direct is PROVEN ──
     $wantComp = switch ($Cfg.RdpCompression) {
         'on'  { $true }
         'off' { $false }
@@ -113,17 +126,17 @@ function Invoke-FabricTailscale {
 
     Save-FabricState $Cfg ([ordered]@{
         host=$Cfg.TsHostname; ip=$Cfg.TsIp
-        path=$(if ($Cfg.TsDirect) {'direct'} else {'DERP relay'}); ts_direct=$Cfg.TsDirect
+        path=$pathLabel; ts_direct=$Cfg.TsDirect
         rdp_compression_effective=$(if ($wantComp) {'on'} else {'off'})
     })
 
     if ($Cfg.Notify) {
         $drop = Join-Path $Cfg.DataRoot 'Drop'
-        $msg = "⚡ <b>Fabric Node Online v$($Cfg.Version)</b>`n`n🖥 <b>Host:</b> <code>$($Cfg.TsHostname)</code>`n🌐 <b>IP:</b> <code>$($Cfg.TsIp)</code>`n🔗 <b>Path:</b> <code>$(if ($Cfg.TsDirect) {'direct'} else {'relay'})</code>`n👤 <b>User:</b> <code>$($Cfg.User)</code>`n🧠 <b>Profile:</b> <code>$($Cfg.Profile)</code>`n⚙️ <b>HW:</b> <code>$($Cfg.Cpu) CPU / $($Cfg.RamGB) GB</code>`n⏳ <b>Duration:</b> <code>$($Cfg.RuntimeMinutes)</code> min`n📁 <b>Drop:</b> <code>$drop</code>"
+        $msg = "⚡ <b>Fabric Node Online v$($Cfg.Version)</b>`n`n🖥 <b>Host:</b> <code>$($Cfg.TsHostname)</code>`n🌐 <b>IP:</b> <code>$($Cfg.TsIp)</code>`n🔗 <b>Path:</b> <code>$pathLabel</code>`n👤 <b>User:</b> <code>$($Cfg.User)</code>`n🧠 <b>Profile:</b> <code>$($Cfg.Profile)</code>`n⚙️ <b>HW:</b> <code>$($Cfg.Cpu) CPU / $($Cfg.RamGB) GB</code>`n⏳ <b>Duration:</b> <code>$($Cfg.RuntimeMinutes)</code> min`n📁 <b>Drop:</b> <code>$drop</code>"
         Send-FabricNotify $Cfg $msg
     }
 
-    Write-Host ("Tailscale online: {0} ({1}) path={2}" -f $Cfg.TsIp, $Cfg.TsHostname, $(if ($Cfg.TsDirect) {'direct'} else {'DERP'})) -ForegroundColor Green
+    Write-Host ("Tailscale online: {0} ({1}) path={2}" -f $Cfg.TsIp, $Cfg.TsHostname, $pathLabel) -ForegroundColor Green
     Write-FabricLog $Cfg ("CONNECT → {0} user={1} path={2} compression={3} (RDP accepts tailnet only)" -f `
-        $Cfg.TsIp, $Cfg.User, $(if ($Cfg.TsDirect) {'direct'} else {'DERP'}), $(if ($wantComp) {'on'} else {'off'}))
+        $Cfg.TsIp, $Cfg.User, $pathLabel, $(if ($wantComp) {'on'} else {'off'}))
 }
