@@ -1,5 +1,7 @@
 # lib/Tune.ps1 — Phase 1a (services/power, image-aware) + Phase 1b
 # (memory/scheduler). Best-effort, full mode only.
+# v9.1: S5 — Spooler + WinRM join the GHA starve list (printers are already
+# disabled in Rdp.ps1; WinRM is an extra Azure-NIC listener). mpssvc untouched.
 
 function Invoke-FabricTuneServices {
     param([pscustomobject]$Cfg)
@@ -30,20 +32,21 @@ function Invoke-FabricTuneServices {
     }
 
     # Biggest real win on the GHA image: stop baked-in heavy stacks the RDP
-    # session never uses. (interactive/auto only — compute may want them.)
+    # session never uses. Spooler is dead weight too (RDP printing is off in
+    # Phase 1c); WinRM is an extra listener on the Azure NIC.
     if ($Cfg.Image -eq 'GhaWindowsLatest' -and $Cfg.Profile -ne 'compute') {
         foreach ($name in @('docker','com.docker.service','WSLService','W3SVC','WAS','AppHostSvc',
-                            'ServiceFabricLocalClusterManager','sshd')) {
+                            'ServiceFabricLocalClusterManager','sshd','Spooler','WinRM')) {
             Get-Service -Name $name -ErrorAction SilentlyContinue | ForEach-Object {
                 Stop-Service -Name $_.Name -Force -ErrorAction SilentlyContinue
                 Set-Service -Name $_.Name -StartupType Disabled -ErrorAction SilentlyContinue
             }
         }
-        Write-FabricLog $Cfg "Starved: Docker/WSL/IIS/ServiceFabric/sshd."
+        Write-FabricLog $Cfg "Starved: Docker/WSL/IIS/ServiceFabric/sshd/Spooler/WinRM."
     }
 
     # Keep alive — never touch mpssvc (the firewall owns the 3389 scope).
-    foreach ($svc in @('Spooler','LanmanServer','LanmanWorkstation','Winmgmt','CryptSvc','EventLog',
+    foreach ($svc in @('LanmanServer','LanmanWorkstation','Winmgmt','CryptSvc','EventLog',
                        'RpcSs','DcomLaunch','ProfSvc','Schedule','TermService','UmRdpService',
                        'SessionEnv','Audiosrv','AudioEndpointBuilder','mpssvc')) {
         Set-Service -Name $svc -StartupType Automatic -ErrorAction SilentlyContinue
