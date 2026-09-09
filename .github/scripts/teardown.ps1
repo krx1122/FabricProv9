@@ -2,6 +2,8 @@
 # GitHub-hosted: Tailscale logout + task cleanup (the VM dies anyway).
 # Self-hosted / persistent runner: also remove the admin account, the firewall
 # rules, and the widened ACLs — otherwise the next job inherits an admin.
+# v9.1: M3 — hosted detection keys off RUNNER_ENVIRONMENT (authoritative),
+# never the runner label string (labels like 'windows-2025' would mis-classify).
 $ErrorActionPreference = 'SilentlyContinue'
 
 $root = $env:FABRIC_ROOT
@@ -11,7 +13,12 @@ if (-not $user) { $user = 'FabricAdmin' }
 
 $st = $null
 try { $st = Get-Content -LiteralPath (Join-Path $root 'state.json') -Raw | ConvertFrom-Json } catch {}
-$hosted = ($env:FAB_RUNNER_IMAGE -eq 'windows-latest') -or ($st -and $st.image -eq 'GhaWindowsLatest')
+
+$hosted = ($env:RUNNER_ENVIRONMENT -eq 'github-hosted')
+if (-not $env:RUNNER_ENVIRONMENT) {
+    # Fallback only if the runner env var is somehow absent.
+    $hosted = ($env:FAB_RUNNER_IMAGE -eq 'windows-latest') -or ($st -and $st.image -eq 'GhaWindowsLatest')
+}
 
 # ── always ──
 $tsPath = 'C:\Program Files\Tailscale\tailscale.exe'
