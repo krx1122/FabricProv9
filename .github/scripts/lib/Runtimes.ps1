@@ -3,6 +3,8 @@
 # 6/7/8/10, WebView2 and 7-Zip — so on that fingerprint this phase is a log
 # line. On generic images it installs ONLY what the Uninstall keys don't show.
 # DirectX web setup is deleted in V9 (pointless on Hyper-V video).
+# v9.1: M1 — Start-Process ArgumentList arrays take raw paths (no embedded
+# quotes; PowerShell quotes paths itself).
 
 function Test-FabricInstalled {
     param([string]$Pattern)
@@ -54,12 +56,12 @@ function Invoke-FabricRuntimes {
         return
     }
 
-    # Parallel fetch, serialized install.
+    # Parallel fetch, serialized install. Raw paths in ArgumentList (M1).
     $pending = @()
     foreach ($p in $todo) {
         $dst = Join-Path $tools $p.n
         Remove-Item -LiteralPath $dst, "$dst.part" -Force -ErrorAction SilentlyContinue
-        $proc = Start-Process -FilePath 'curl.exe' -ArgumentList @('-sS','-L','--retry','2','--retry-all-errors','-m','300','-o',"`"$dst.part`"",$p.u) -WindowStyle Hidden -PassThru
+        $proc = Start-Process -FilePath 'curl.exe' -ArgumentList @('-sS','-L','--retry','2','--retry-all-errors','-m','300','-o',"$dst.part",$p.u) -WindowStyle Hidden -PassThru
         $pending += [pscustomobject]@{ Proc = $proc; Dst = $dst }
     }
     foreach ($h in $pending) {
