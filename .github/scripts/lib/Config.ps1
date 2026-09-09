@@ -1,5 +1,6 @@
 # lib/Config.ps1 — config resolver, logging, merge-only state, shared helpers.
 # One $cfg object is built here and passed into every phase.
+# v9.1: Version bump, state JSON depth 6 (S6).
 
 function ConvertTo-FabricBool {
     param([string]$v)
@@ -45,7 +46,7 @@ function Resolve-FabricConfig {
 
     [pscustomobject]@{
         # ── contract ──
-        Version         = '9.0'
+        Version         = '9.1'
         Mode            = $modeRaw
         RuntimeMinutes  = $rt
         JobTimeoutMin   = [math]::Min(360, $rt + 15)
@@ -123,7 +124,7 @@ function Save-FabricState {
     $existing = Get-FabricState $Cfg
     if ($existing) { foreach ($p in $existing.PSObject.Properties) { $merged[$p.Name] = $p.Value } }
     foreach ($k in $Fields.Keys) { $merged[$k] = $Fields[$k] }
-    ($merged | ConvertTo-Json) | Set-Content -Path (Join-Path $Cfg.FabricRoot 'state.json') -Encoding UTF8
+    ($merged | ConvertTo-Json -Depth 6) | Set-Content -Path (Join-Path $Cfg.FabricRoot 'state.json') -Encoding UTF8
 }
 
 # ── registry helper (ensures key, consistent error accounting) ───────────────
