@@ -1,5 +1,5 @@
 # ═════════════════════════════════════════════════════════════════════════════
-#  RDP FABRIC PRO v9.0 — main entry
+#  RDP FABRIC PRO v9.1 — main entry
 #  pwsh -NoProfile -File .github/scripts/Fabric.ps1 -Mode full [-Param ...]
 #
 #  Design (see RDP-Fabric-Rebuild-Guide):
@@ -8,7 +8,8 @@
 #   * Phases are declared fatal or best-effort HERE, nowhere else.
 #     Fatal: 0 Inventory, 1c RDP, 2 Tailscale. Everything else is best-effort.
 #   * Modules dot-source from lib/; session scripts live in session/.
-#   * No cycles, no GH_PAT, no self-dispatch — single-shot session.
+#   * v9.1: Net.ps1 wired as Phase 2.1 (after Tailscale — both NICs exist,
+#     before runtimes). No cycles, no GH_PAT, no self-dispatch.
 # ═════════════════════════════════════════════════════════════════════════════
 [CmdletBinding()]
 param(
@@ -27,7 +28,7 @@ $ErrorActionPreference = 'Continue'
 $ProgressPreference    = 'SilentlyContinue'
 
 $lib = Join-Path $PSScriptRoot 'lib'
-foreach ($m in @('Config.ps1','Inventory.ps1','Tune.ps1','Disk.ps1','Rdp.ps1','Tailscale.ps1','Runtimes.ps1','Workstation.ps1','Hold.ps1')) {
+foreach ($m in @('Config.ps1','Inventory.ps1','Tune.ps1','Disk.ps1','Rdp.ps1','Tailscale.ps1','Net.ps1','Runtimes.ps1','Workstation.ps1','Hold.ps1')) {
     $p = Join-Path $lib $m
     if (-not (Test-Path -LiteralPath $p)) { throw "Missing module: $p" }
     . $p
@@ -57,6 +58,7 @@ if ($cfg.Mode -eq 'full') {
 }
 Invoke-FabricPhase -Cfg $cfg -Name 'Phase 2 — Tailscale'   -Fatal -Block { Invoke-FabricTailscale $cfg }
 if ($cfg.Mode -eq 'full') {
+    Invoke-FabricPhase -Cfg $cfg -Name 'Phase 2.1 — Azure NIC/TCP' -Block { Invoke-FabricNetStack $cfg }
     Invoke-FabricPhase -Cfg $cfg -Name 'Phase 2.5 — runtimes'      -Block { Invoke-FabricRuntimes $cfg }
     Invoke-FabricPhase -Cfg $cfg -Name 'Phase 2.7 — workstation'   -Block { Invoke-FabricWorkstation $cfg }
     Invoke-FabricPhase -Cfg $cfg -Name 'Phase 2.8 — session UX'    -Block { Register-FabricSessionUx $cfg }
