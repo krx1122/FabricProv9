@@ -1,9 +1,12 @@
 # session/EdgeEnsure.ps1 — open the startup URL once, single-instance via mutex.
 # -Match is the regex used to detect an already-running window (the caller
 # passes the regex-escaped URL host, so changing the URL never breaks detection).
+# -SoftwareGpu (v9.1): no real GPU on this node — force software rendering
+# instead of GPU flags that blank/crash on a 0 MB Hyper-V adapter.
 param(
   [string]$Url,
-  [string]$Match
+  [string]$Match,
+  [switch]$SoftwareGpu
 )
 $ErrorActionPreference = 'SilentlyContinue'
 if (-not $Url) { exit }
@@ -18,7 +21,8 @@ try {
   $running = Get-CimInstance Win32_Process -Filter "name='msedge.exe'" -ErrorAction SilentlyContinue |
       Where-Object { $_.CommandLine -match $Match }
   if (-not $running) {
-    $flags = '--no-first-run --no-default-browser-check --disable-sync --disable-background-networking --disable-features=Translate,MediaRouter --enable-gpu-rasterization --ignore-gpu-blocklist --disable-gpu-vsync --disable-pinch'
+    $flags = '--no-first-run --no-default-browser-check --disable-sync --disable-background-networking --disable-features=Translate,MediaRouter --disable-pinch'
+    if ($SoftwareGpu) { $flags += ' --disable-gpu --disable-gpu-compositing --in-process-gpu' }
     Start-Process -FilePath $edge -ArgumentList "--new-window $Url $flags"
   }
 } finally { $mutex.ReleaseMutex() }
