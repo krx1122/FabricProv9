@@ -1,7 +1,25 @@
 # lib/Inventory.ps1 — Phase 0 (fatal).
-# Does: secret checks, deadline.txt (once), hardware/disk measure, image
-# fingerprint, profile resolution, async pinned Tailscale fetch, state contract.
+# Does: secret checks (incl. Windows password policy), deadline.txt (once),
+# hardware/disk measure, image fingerprint (RUNNER_ENVIRONMENT), profile
+# resolution, async pinned Tailscale fetch, state contract.
 # Must NOT: touch Defender, pagefile, HKCU, or redirect TEMP yet.
+# v9.1: M1 (curl args unquoted), M3 (fingerprint), S7 (password check matches
+# the real Windows policy — no invented substring bans).
+
+# Pre-flight the password against the Server 2025 policy so a bad secret fails
+# in Phase 0 with a readable reason instead of an InvalidPasswordException in 1c.
+function Test-FabricPassword {
+    param([string]$Password, [string]$User)
+    if ($Password.Length -lt 8) { return 'under 8 characters' }
+    $classes = 0
+    if ($Password -match '[a-z]')       { $classes++ }
+    if ($Password -match '[A-Z]')       { $classes++ }
+    if ($Password -match '\d')          { $classes++ }
+    if ($Password -match '[^a-zA-Z0-9]') { $classes++ }
+    if ($classes -lt 3) { return 'needs at least 3 of: lowercase, uppercase, digit, symbol' }
+    if ($User -and $Password -match ('(?i)' + [regex]::Escape($User))) { return "must not contain the account name '$User'" }
+    return $null
+}
 
 function Invoke-FabricInventory {
     param([pscustomobject]$Cfg)
@@ -9,7 +27,8 @@ function Invoke-FabricInventory {
 
     if (-not $env:RDP_PASS)   { throw "RDP_PASSWORD secret is missing (env RDP_PASS)." }
     if (-not $env:TS_AUTHKEY) { throw "TAILSCALE_AUTH_KEY secret is missing (env TS_AUTHKEY)." }
-    if ($env:RDP_PASS.Length -lt 8) { throw "RDP_PASSWORD must be >= 8 chars (Server 2025 policy floor)." }
+    $pwProblem = Test-FabricPassword -Password $env:RDP_PASS -User $Cfg.User
+    if ($pwProblem) { throw "RDP_PASSWORD rejected by Windows policy: $pwProblem." }
 
     New-Item -ItemType Directory -Path $Cfg.FabricRoot -Force | Out-Null
     $Cfg.LogReady = $true
@@ -47,11 +66,10 @@ function Invoke-FabricInventory {
     $Cfg.DataRoot   = if ($best -and $best.DriveLetter -ne $sysLetter) { "$($best.DriveLetter):\RDPFabric\Data" }
                       else { Join-Path $Cfg.FabricRoot 'Data' }
 
-    # ── image fingerprint ──
-    $isServer2025 = ($Cfg.OsCaption -match 'Windows Server 2025')
-    $hasIdeBits   = (Test-Path 'C:\Program Files\Microsoft Visual Studio') -or
-                    (Test-Path "${env:ProgramFiles(x86)}\Microsoft\EdgeWebView")
-    $Cfg.Image = if ($Cfg.IsGHA -and $isServer2025 -and $hasIdeBits) { 'GhaWindowsLatest' }
+    # ── image fingerprint (M3: key off RUNNER_ENVIRONMENT, not a label string) ──
+    $hasIdeBits = (Test-Path 'C:\Program Files\Microsoft Visual Studio') -or
+                  (Test-Path "${env:ProgramFiles(x86)}\Microsoft\EdgeWebView")
+    $Cfg.Image = if ($env:RUNNER_ENVIRONMENT -eq 'github-hosted' -and $hasIdeBits) { 'GhaWindowsLatest' }
                  elseif ($Cfg.OsCaption -match 'Server') { 'ServerGeneric' }
                  else { 'ClientGeneric' }
 
@@ -77,12 +95,14 @@ function Invoke-FabricInventory {
     # ── async Tailscale MSI (pinned version) into FabricRoot\cache ──
     # Started NOW, before any TEMP redirect; a bare curl process, no wrapper
     # script, no marker file — Phase 2 waits on the handle and verifies size.
+    # M1: ArgumentList array items are passed raw — PowerShell quotes paths
+    # itself. Embedding quotes makes curl create a file whose name contains ".
     $cacheDir = Split-Path $Cfg.TsMsiPath
     New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null
     Remove-Item -LiteralPath $Cfg.TsMsiPath, $Cfg.TsPartPath -Force -ErrorAction SilentlyContinue
     $Cfg.TsDlProc = Start-Process -FilePath 'curl.exe' -PassThru -WindowStyle Hidden -ArgumentList @(
         '-sS','-L','--retry','3','--retry-all-errors','-m','300','--connect-timeout','15',
-        '-o', "`"$($Cfg.TsPartPath)`"", $Cfg.TsMsiUrl)
+        '-o', $Cfg.TsPartPath, $Cfg.TsMsiUrl)
     Write-FabricLog $Cfg "Tailscale $($Cfg.TsVersion) MSI downloading in background (pid $($Cfg.TsDlProc.Id))."
 
     # ── state contract ──
@@ -92,7 +112,8 @@ function Invoke-FabricInventory {
         data_root=$Cfg.DataRoot; best_letter=$Cfg.BestLetter; profile=$Cfg.Profile
         ram_gb=$Cfg.RamGB; free_ram_gb=$Cfg.FreeRamGB; cpu=$Cfg.Cpu; cpu_cores=$Cfg.CpuCores
         cpu_name=$Cfg.CpuName; os_caption=$Cfg.OsCaption; hostname=$Cfg.NodeName
-        gha=$Cfg.IsGHA; image=$Cfg.Image; c_free_gb=$Cfg.CFreeGB; d_free_gb=$Cfg.DFreeGB
+        gha=$Cfg.IsGHA; runner_env=$env:RUNNER_ENVIRONMENT; image=$Cfg.Image
+        c_free_gb=$Cfg.CFreeGB; d_free_gb=$Cfg.DFreeGB
         has_real_gpu=$Cfg.HasRealGpu; ramdisk=$Cfg.Ramdisk; rdp_compression=$Cfg.RdpCompression
         reclaim_disk=$Cfg.ReclaimDisk; notify=$Cfg.Notify
         startup_url_set=(-not [string]::IsNullOrWhiteSpace($Cfg.StartupUrl)); ts_version=$Cfg.TsVersion
