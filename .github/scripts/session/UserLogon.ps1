@@ -4,12 +4,14 @@
 #
 #   1. HKCU desktop timeouts / visual effects
 #   2. One-time service nudge (then the hold loop leaves services alone)
-#   3. Start the countdown timer (sibling FabricTimer.ps1, self-mutexed)
-#   4. If -StartupUrl: start Edge once (sibling EdgeEnsure.ps1, self-mutexed)
+#   3. Software-rendering env when -SoftwareGpu (no real GPU → RDP session)
+#   4. Start the countdown timer (sibling FabricTimer.ps1, self-mutexed)
+#   5. If -StartupUrl: start Edge once (sibling EdgeEnsure.ps1, self-mutexed)
 param(
     [string]$StartupUrl = '',
     [string]$DeadlineFile = 'C:\ProgramData\RDPFabric\deadline.txt',
-    [int]$FallbackMinutes = 345
+    [int]$FallbackMinutes = 345,
+    [switch]$SoftwareGpu
 )
 $ErrorActionPreference = 'Continue'
 $log = 'C:\ProgramData\RDPFabric\session.log'
@@ -38,7 +40,19 @@ try {
     }
     Write-SessionLog 'Service nudge done (one-shot).'
 
-    # 3. countdown timer
+    # 3. S4: software rendering for GPU-less RDP — fixes "works on console,
+    # dies in RDP" for many tools. User scope (apps launched later) AND process
+    # scope (children started below inherit it immediately).
+    if ($SoftwareGpu) {
+        foreach ($k in 'D3D_FORCE_WARP','QT_OPENGL','LIBGL_ALWAYS_SOFTWARE') {
+            $v = if ($k -eq 'QT_OPENGL') { 'software' } else { '1' }
+            [Environment]::SetEnvironmentVariable($k, $v, 'User')
+            Set-Item -Path "env:$k" -Value $v
+        }
+        Write-SessionLog 'Software-GL env set (no real GPU).'
+    }
+
+    # 4. countdown timer
     $timer = Join-Path $PSScriptRoot 'FabricTimer.ps1'
     if (Test-Path -LiteralPath $timer) {
         Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @(
@@ -47,15 +61,16 @@ try {
         Write-SessionLog "timer started ($DeadlineFile)."
     } else { Write-SessionLog "MISSING: $timer" }
 
-    # 4. optional Edge auto-open
+    # 5. optional Edge auto-open
     if ($StartupUrl) {
         $edge = Join-Path $PSScriptRoot 'EdgeEnsure.ps1'
         $match = [regex]::Escape($StartupUrl)
         try { $h = ([uri]$StartupUrl).Host; if ($h) { $match = [regex]::Escape($h) } } catch {}
         if (Test-Path -LiteralPath $edge) {
-            Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @(
-                '-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$edge`"",
-                '-Url',"`"$StartupUrl`"",'-Match',"`"$match`"")
+            $edgeArgs = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$edge`"",
+                          '-Url',"`"$StartupUrl`"",'-Match',"`"$match`"")
+            if ($SoftwareGpu) { $edgeArgs += '-SoftwareGpu' }
+            Start-Process powershell.exe -WindowStyle Hidden -ArgumentList $edgeArgs
             Write-SessionLog "edge launched once ($StartupUrl)."
         } else { Write-SessionLog "MISSING: $edge" }
     }
