@@ -2,11 +2,8 @@
 # RDPFabric-Session scheduled task (elevated, 5s delay). Because it runs as
 # the RDP user, HKCU writes land in the right hive.
 #
-#   1. HKCU desktop timeouts / visual effects
-#   2. One-time service nudge (then the hold loop leaves services alone)
-#   3. Software-rendering env when -SoftwareGpu (no real GPU → RDP session)
-#   4. Start the countdown timer (sibling FabricTimer.ps1, self-mutexed)
-#   5. If -StartupUrl: start Edge once (sibling EdgeEnsure.ps1, self-mutexed)
+# v9.3: the one-time Defender nudge respects lockdown mode (skipped when the
+# workflow ran with lockdown=true — reads it from state.json).
 param(
     [string]$StartupUrl = '',
     [string]$DeadlineFile = 'C:\ProgramData\RDPFabric\deadline.txt',
@@ -33,16 +30,20 @@ try {
     Set-ItemProperty -Path $ve -Name 'VisualFXSetting' -Value 2 -Type DWord -Force -ErrorAction SilentlyContinue
     Write-SessionLog 'HKCU tweaks applied (as RDP user).'
 
-    # 2. one-time service nudge — once after logon, then stop
-    try { Set-MpPreference -DisableRealtimeMonitoring $true -Force -ErrorAction SilentlyContinue } catch {}
-    foreach ($s in @('WSearch','SysMain','DoSvc','wuauserv','bits','WerSvc')) {
-        Stop-Service -Name $s -Force -ErrorAction SilentlyContinue
+    # 2. one-time service nudge — skipped in lockdown mode
+    $st = $null
+    try { $st = Get-Content 'C:\ProgramData\RDPFabric\state.json' -Raw | ConvertFrom-Json } catch {}
+    if (-not ($st -and $st.lockdown -eq $true)) {
+        try { Set-MpPreference -DisableRealtimeMonitoring $true -Force -ErrorAction SilentlyContinue } catch {}
+        foreach ($s in @('WSearch','SysMain','DoSvc','wuauserv','bits','WerSvc')) {
+            Stop-Service -Name $s -Force -ErrorAction SilentlyContinue
+        }
+        Write-SessionLog 'Service nudge done (one-shot).'
+    } else {
+        Write-SessionLog 'Lockdown mode — service nudge skipped.'
     }
-    Write-SessionLog 'Service nudge done (one-shot).'
 
-    # 3. S4: software rendering for GPU-less RDP — fixes "works on console,
-    # dies in RDP" for many tools. User scope (apps launched later) AND process
-    # scope (children started below inherit it immediately).
+    # 3. software rendering for GPU-less RDP
     if ($SoftwareGpu) {
         foreach ($k in 'D3D_FORCE_WARP','QT_OPENGL','LIBGL_ALWAYS_SOFTWARE') {
             $v = if ($k -eq 'QT_OPENGL') { 'software' } else { '1' }
@@ -61,7 +62,7 @@ try {
         Write-SessionLog "timer started ($DeadlineFile)."
     } else { Write-SessionLog "MISSING: $timer" }
 
-    # 5. optional Edge auto-open
+    # 5. optional Edge auto-open (URL was validated HTTPS-only by the engine)
     if ($StartupUrl) {
         $edge = Join-Path $PSScriptRoot 'EdgeEnsure.ps1'
         $match = [regex]::Escape($StartupUrl)
