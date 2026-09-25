@@ -1,6 +1,7 @@
 # lib/Disk.ps1 — Phase 1d (best-effort, full only).
-# Honest pagefile: a live resize only fully applies at boot, so we record the
-# ACTUAL size in state instead of claiming the target.
+# v9.3 (audit fix 5): scratch env vars are set in the CURRENT process first,
+# then persisted at Machine scope — later phases (runtimes, downloads) actually
+# inherit them this run.
 
 function Invoke-FabricDisk {
     param([pscustomobject]$Cfg)
@@ -11,7 +12,6 @@ function Invoke-FabricDisk {
             ForEach-Object { Remove-Item -Path $_ -Force -ErrorAction SilentlyContinue }
     }
 
-    # Contract dirs (also re-created in Workstation defensively).
     foreach ($d in @($Cfg.DataRoot, (Join-Path $Cfg.DataRoot 'Temp'),
                      (Join-Path $Cfg.DataRoot 'Drop'), (Join-Path $Cfg.DataRoot 'Tools'))) {
         New-Item -ItemType Directory -Path $d -Force | Out-Null
@@ -58,14 +58,11 @@ function Invoke-FabricDisk {
         }
         Remove-Job $job -Force -ErrorAction SilentlyContinue
     }
-    # Record reality, not the target.
     $pfMb = [int]((Get-CimInstance Win32_PageFileUsage -ErrorAction SilentlyContinue | Measure-Object AllocatedBaseSize -Sum).Sum)
     Save-FabricState $Cfg ([ordered]@{ pagefile_mb = $pfMb })
     Write-FabricLog $Cfg "Pagefile actual: ${pfMb} MB this session (target ${targetMB} MB applies fully after a boot that never comes)."
 
-    # ── scratch env: TEMP/TMP + package caches onto the scratch volume ──
-    # Safe now: the Tailscale MSI download started in Phase 0 targets
-    # FabricRoot\cache and never touches TEMP.
+    # ── scratch env: process scope FIRST (this run), then Machine (persist) ──
     $scratch = Join-Path $Cfg.DataRoot 'Temp'
     $envMap = [ordered]@{
         'TEMP'             = $scratch
@@ -75,7 +72,11 @@ function Invoke-FabricDisk {
         'npm_config_cache' = (Join-Path $Cfg.DataRoot 'npm-cache')
         'DOTNET_CLI_HOME'  = (Join-Path $Cfg.DataRoot 'dotnet')
     }
-    foreach ($k in $envMap.Keys) { [Environment]::SetEnvironmentVariable($k, $envMap[$k], 'Machine') }
+    foreach ($k in $envMap.Keys) {
+        New-Item -ItemType Directory -Path $envMap[$k] -Force -ErrorAction SilentlyContinue | Out-Null
+        Set-Item -Path "env:$k" -Value $envMap[$k]
+        [Environment]::SetEnvironmentVariable($k, $envMap[$k], 'Machine')
+    }
 
     # ── ramdisk: only ever on big self-hosted nodes (never on 16 GB) ──
     if ($Cfg.Ramdisk) {
@@ -102,6 +103,8 @@ function Invoke-FabricDisk {
                     & $imdisk -a -s ${sizeMB}M -m R: -p "/fs:ntfs /q /y" | Out-Null
                     if (Test-Path "R:\") {
                         New-Item -ItemType Directory -Path "R:\Temp" -Force | Out-Null
+                        Set-Item -Path "env:TEMP" -Value 'R:\Temp'
+                        Set-Item -Path "env:TMP" -Value 'R:\Temp'
                         [Environment]::SetEnvironmentVariable('TEMP', 'R:\Temp', 'Machine')
                         [Environment]::SetEnvironmentVariable('TMP', 'R:\Temp', 'Machine')
                         Write-FabricLog $Cfg "RAM disk R: ${sizeMB} MB mounted."
