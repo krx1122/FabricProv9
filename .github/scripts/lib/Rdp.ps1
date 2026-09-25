@@ -1,8 +1,8 @@
 # lib/Rdp.ps1 — Phase 1c (fatal).
 # Verified local admin + tailnet-scoped firewall + RDP picture-quality keys.
-# v9.3 (audit): NLA explicitly required, SecurityLayer=TLS, MinEncryptionLevel=3
-# (High), and the listener AND firewall scope are both verified before the
-# phase reports success.
+# v9.3: NLA required, SecurityLayer=TLS, MinEncryptionLevel=3, verified.
+# v9.3.1: firewall create/delete is observable; verification failure message
+# names the exact rule/CIDR that failed.
 
 function Ensure-LocalAdmin {
     param([pscustomobject]$Cfg)
@@ -29,15 +29,12 @@ function Set-FabricRdpFirewall {
     param([pscustomobject]$Cfg)
     Disable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
     $tailnet = @('100.64.0.0/10', 'fd7a:115c:a1e0::/48')
-    Ensure-FabricFirewallRule 'RDP-TCP-In-Tailscale' -Direction Inbound  -Protocol TCP -Port 3389  -RemoteAddress $tailnet
-    Ensure-FabricFirewallRule 'RDP-UDP-In-Tailscale' -Direction Inbound  -Protocol UDP -Port 3389  -RemoteAddress $tailnet
-    Ensure-FabricFirewallRule 'Tailscale-In-UDP'     -Direction Inbound  -Protocol UDP -Port 41641
-    Ensure-FabricFirewallRule 'Tailscale-Out-UDP'    -Direction Outbound -Protocol UDP -Port 41641 -Remote
+    Set-FabricFirewallRule -Cfg $Cfg -DisplayName 'RDP-TCP-In-Tailscale' -Direction Inbound  -Protocol TCP -Port 3389  -RemoteAddress $tailnet
+    Set-FabricFirewallRule -Cfg $Cfg -DisplayName 'RDP-UDP-In-Tailscale' -Direction Inbound  -Protocol UDP -Port 3389  -RemoteAddress $tailnet
+    Set-FabricFirewallRule -Cfg $Cfg -DisplayName 'Tailscale-In-UDP'     -Direction Inbound  -Protocol UDP -Port 41641
+    Set-FabricFirewallRule -Cfg $Cfg -DisplayName 'Tailscale-Out-UDP'    -Direction Outbound -Protocol UDP -Port 41641 -Remote
 }
 
-# Picture quality + compression in one place, callable any time.
-# Compression OFF unless the path is DERP-relayed (the #1 progressive-blur
-# cause, and it burns a full thread on a 4t box).
 function Set-FabricRdpPictureQuality {
     param([pscustomobject]$Cfg, [bool]$Relayed)
     $rdpTcp = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
@@ -74,14 +71,13 @@ function Invoke-FabricRdp {
     Set-FabricReg $Cfg $tsPol  "MaxDisconnectionTime" 0
     Set-FabricReg $Cfg $tsPol  "KeepAliveEnable" 1
     Set-FabricReg $Cfg $tsPol  "KeepAliveInterval" 1
-    Set-FabricReg $Cfg $tsPol  "fDisableCdm" 0          # drive mapping on
-    Set-FabricReg $Cfg $tsPol  "fDisableClip" 0         # clipboard on
-    Set-FabricReg $Cfg $tsPol  "fDisableCpm" 1          # printer redirection off
+    Set-FabricReg $Cfg $tsPol  "fDisableCdm" 0
+    Set-FabricReg $Cfg $tsPol  "fDisableClip" 0
+    Set-FabricReg $Cfg $tsPol  "fDisableCpm" 1
     Set-FabricReg $Cfg $tsPol  "fDisableLPT" 1
     Set-FabricReg $Cfg $tsPol  "fDisableAudioCapture" 1
 
     $rdpTcp = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
-    # Audit fix 3: NLA required, TLS security layer, High (128-bit) encryption.
     Set-FabricReg $Cfg $tsPol  "UserAuthentication" 1 -Important   # NLA
     Set-FabricReg $Cfg $rdpTcp "UserAuthentication" 1 -Important
     Set-FabricReg $Cfg $rdpTcp "SecurityLayer" 2 -Important        # TLS (SSL)
@@ -91,7 +87,6 @@ function Invoke-FabricRdp {
 
     Set-FabricRdpFirewall $Cfg
 
-    # Contract: listener must exist AND the firewall must be verifiably scoped.
     Start-Sleep -Milliseconds 500
     if (-not (Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue)) {
         Restart-Service TermService -Force -ErrorAction SilentlyContinue
@@ -100,8 +95,9 @@ function Invoke-FabricRdp {
             throw "RDP listener is not up on 3389."
         }
     }
-    if (-not (Test-FabricRdpFirewall $Cfg)) {
-        throw "RDP firewall verification failed — 3389 rules are missing, disabled, or not tailnet-scoped."
+    $fwReason = ''
+    if (-not (Test-FabricRdpFirewall $Cfg ([ref]$fwReason))) {
+        throw "RDP firewall verification failed: $fwReason"
     }
 
     $nla = (Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' -Name UserAuthentication -ErrorAction SilentlyContinue).UserAuthentication
