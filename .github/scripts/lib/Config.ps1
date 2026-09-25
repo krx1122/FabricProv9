@@ -1,8 +1,9 @@
 # lib/Config.ps1 — config resolver, logging, merge-only state, shared helpers.
 # One $cfg object is built here and passed into every phase.
-# v9.3: audit pass — strict input validation (enum/URL/user/hash), version 9.3.
-# v9.3.1: firewall create/verify is observable (delete+recreate with real
-# errors; verification returns a reason string, not a blind boolean).
+# v9.3: audit pass — strict input validation (enum/URL/user/hash).
+# v9.3.1: firewall create/verify is observable.
+# v9.3.2: scope comparison normalizes CIDR vs dotted-netmask (the rule store
+# reports 100.64.0.0/10 as 100.64.0.0/255.192.0.0).
 
 function ConvertTo-FabricBool {
     param([string]$v)
@@ -188,7 +189,8 @@ function Test-FabricFile {
     return ($fi -and $fi.Length -ge $MinBytes)
 }
 
-# ── Firewall (v9.3.1): delete-then-create (idempotent) with REAL errors ──────
+# ── Firewall (v9.3.2): delete-then-create with REAL errors; scope compare
+# understands both CIDR and dotted-netmask forms the rule store returns. ──────
 function Set-FabricFirewallRule {
     param(
         [pscustomobject]$Cfg,
@@ -212,24 +214,43 @@ function Set-FabricFirewallRule {
     }
 }
 
-# Verification that tells you WHY it failed (logged, not just thrown blind).
+# Canonicalize "addr/len" and "addr/dottedmask" so 100.64.0.0/10 matches
+# 100.64.0.0/255.192.0.0 (what Get-NetFirewallAddressFilter reports).
+function ConvertTo-FabricCidr {
+    param([string]$Scope)
+    $s = "$Scope".Trim()
+    if ($s -notmatch '/') { return $s.ToLowerInvariant() }
+    $addr, $mask = $s -split '/', 2
+    if ($mask -match '^\d+$') { return "$addr/$mask".ToLowerInvariant() }
+    # dotted netmask → prefix length (IPv4)
+    if ($mask -match '^\d{1,3}(\.\d{1,3}){3}$') {
+        $bits = 0
+        foreach ($oct in ($mask -split '\.')) {
+            $b = [int]$oct
+            while ($b -gt 0) { $bits += ($b -band 1); $b = $b -shr 1 }
+        }
+        return "$addr/$bits".ToLowerInvariant()
+    }
+    return $s.ToLowerInvariant()
+}
+
 function Test-FabricRdpFirewall {
     param([pscustomobject]$Cfg, [ref]$Reason)
     $Reason.Value = 'ok'
-    $expected = @('100.64.0.0/10','fd7a:115c:a1e0::/48')
+    $expected = @('100.64.0.0/10','fd7a:115c:a1e0::/48') | ForEach-Object { ConvertTo-FabricCidr $_ }
     foreach ($name in @('RDP-TCP-In-Tailscale','RDP-UDP-In-Tailscale')) {
         $rule = Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue
         if (-not $rule) { $Reason.Value = "missing rule '$name'"; return $false }
         if (-not $rule.Enabled) { $Reason.Value = "rule '$name' disabled"; return $false }
-        $addr = @($rule | Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue | Select-Object -ExpandProperty RemoteAddress)
+        $addr = @($rule | Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue |
+                    Select-Object -ExpandProperty RemoteAddress | ForEach-Object { ConvertTo-FabricCidr $_ })
         foreach ($cidr in $expected) {
-            if (-not ($addr | Where-Object { $_.Trim() -ieq $cidr })) {
+            if ($addr -notcontains $cidr) {
                 $Reason.Value = "rule '$name' missing scope $cidr (has: $($addr -join ', '))"
                 return $false
             }
         }
     }
-    # The built-in any/any group must stay disabled.
     $group = @(Get-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue | Where-Object Enabled -eq $true)
     if ($group.Count -gt 0) {
         $Reason.Value = "built-in 'Remote Desktop' group re-enabled ($($group[0].DisplayName))"
