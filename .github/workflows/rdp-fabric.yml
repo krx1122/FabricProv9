@@ -1,15 +1,14 @@
 name: "RDP Fabric Pro"
 
-# V9.1 — post-cycles rebuild + Azure NIC/TCP stack (Phase 2.1).
-# No GH_PAT, no actions:write, no self-dispatch. Single-shot session.
-# checkout@v5 (Node 24). Tailscale pin overridable via repo Variables
-# FAB_TS_VERSION / FAB_TS_SHA256.
+# V9.3 — audit pass 1+6: NO dispatch input is interpolated into shell/pwsh code.
+# Everything flows through env vars; the engine validates them.
+# runner_image is validated in the orchestrate job before runs-on ever asks.
 
 on:
   workflow_dispatch:
     inputs:
       runner_image:
-        description: "Runner label (windows-latest = 4c/16GB)"
+        description: "Runner label. Public: windows-latest / windows-2025. Self-hosted needs repo variable FAB_ALLOW_SELF_HOSTED=true"
         required: false
         default: "windows-latest"
       instance_count:
@@ -33,7 +32,7 @@ on:
         type: boolean
         default: false
       rdp_compression:
-        description: "RDP wire compression: auto = off on direct path, on when relayed"
+        description: "RDP wire compression: auto = off on direct, on when relayed"
         required: false
         default: "auto"
         type: choice
@@ -47,16 +46,24 @@ on:
         type: boolean
         default: false
       startup_url:
-        description: "Optional URL to open at logon (empty = none)"
+        description: "Optional HTTPS URL to open at logon (empty = none; non-HTTPS is rejected)"
         required: false
         default: ""
       notify:
         description: "Send Telegram online/failure pings"
         type: boolean
         default: false
+      lockdown:
+        description: "Audit mode: keep Defender, SmartScreen, UAC secure prompts and default exec policy"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+
+concurrency:
+  group: rdp-fabric-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   orchestrate:
@@ -64,23 +71,48 @@ jobs:
     outputs:
       matrix: ${{ steps.set.outputs.matrix }}
       timeout: ${{ steps.set.outputs.timeout }}
+      runner: ${{ steps.set.outputs.runner }}
+    env:
+      IN_COUNT: ${{ inputs.instance_count }}
+      IN_RUNTIME: ${{ inputs.runtime_minutes }}
+      IN_QUICK: ${{ inputs.quick_test }}
+      IN_RUNNER: ${{ inputs.runner_image }}
+      ALLOW_SELFHOSTED: ${{ vars.FAB_ALLOW_SELF_HOSTED }}
     steps:
       - id: set
         shell: bash
         run: |
-          count=${{ inputs.instance_count }}
-          runtime=${{ inputs.runtime_minutes }}
-          if [ "${{ inputs.quick_test }}" = "true" ]; then runtime=5; fi
+          set -euo pipefail
+
+          count="$IN_COUNT"
+          runtime="$IN_RUNTIME"
+          [ "$IN_QUICK" = "true" ] && runtime=5
           timeout=$((runtime + 15))
-          if [ "$timeout" -gt 360 ]; then timeout=360; fi
+          [ "$timeout" -gt 360 ] && timeout=360
+
+          # Audit fix 1: runner label allowlist — a self-hosted label points at
+          # an operator-controlled machine that would receive ALL the secrets.
+          runner="$IN_RUNNER"
+          case "$runner" in
+            windows-latest|windows-2025) ;;
+            *)
+              if [ "${ALLOW_SELFHOSTED:-}" = "true" ] && [[ "$runner" =~ ^[A-Za-z0-9._-]+$ ]]; then
+                echo "Self-hosted runner '$runner' approved via FAB_ALLOW_SELF_HOSTED."
+              else
+                echo "::error::runner_image '$runner' rejected. Use windows-latest or set repo variable FAB_ALLOW_SELF_HOSTED=true for a label of [A-Za-z0-9._-]+ only."
+                exit 1
+              fi ;;
+          esac
+
           ids=$(seq 1 "$count" | jq -R . | jq -s -c .)
           echo "matrix={\"id\":$ids}" >> "$GITHUB_OUTPUT"
           echo "timeout=$timeout" >> "$GITHUB_OUTPUT"
-          echo "Orchestrating $count node(s), job timeout ${timeout}m."
+          echo "runner=$runner" >> "$GITHUB_OUTPUT"
+          echo "Orchestrating $count node(s) on $runner, job timeout ${timeout}m."
 
   fabric:
     needs: orchestrate
-    runs-on: ${{ inputs.runner_image }}
+    runs-on: ${{ fromJSON(needs.orchestrate.outputs.runner) }}
     timeout-minutes: ${{ fromJSON(needs.orchestrate.outputs.timeout) }}
     strategy:
       matrix: ${{ fromJson(needs.orchestrate.outputs.matrix) }}
@@ -95,8 +127,8 @@ jobs:
       FABRIC_ROOT: C:\ProgramData\RDPFabric
       MATRIX_ID: ${{ matrix.id }}
       RUN_ID: ${{ github.run_id }}
-      # Input passthrough — engine resolves env first, then -Param, then default.
-      FAB_RUNNER_IMAGE: ${{ inputs.runner_image }}
+      # Input passthrough — env only; the engine validates every value.
+      FAB_RUNNER_IMAGE: ${{ needs.orchestrate.outputs.runner }}
       FAB_INSTANCE_COUNT: ${{ inputs.instance_count }}
       FAB_RUNTIME: ${{ inputs.runtime_minutes }}
       FAB_PROFILE_INPUT: ${{ inputs.workload_profile }}
@@ -106,7 +138,7 @@ jobs:
       FAB_RECLAIM: ${{ inputs.reclaim_disk }}
       FAB_STARTUP_URL: ${{ inputs.startup_url }}
       FAB_NOTIFY: ${{ inputs.notify }}
-      # Optional Tailscale pin overrides (repo Variables, not secrets).
+      FAB_LOCKDOWN: ${{ inputs.lockdown }}
       FAB_TS_VERSION: ${{ vars.FAB_TS_VERSION }}
       FAB_TS_SHA256: ${{ vars.FAB_TS_SHA256 }}
 
@@ -115,16 +147,7 @@ jobs:
 
       - name: Fabric engine
         shell: pwsh
-        run: |
-          pwsh -NoProfile -File .github/scripts/Fabric.ps1 `
-            -Mode full `
-            -WorkloadProfile "${{ inputs.workload_profile }}" `
-            -RdpCompression "${{ inputs.rdp_compression }}" `
-            -QuickTest "${{ inputs.quick_test }}" `
-            -EnableRamdisk "${{ inputs.enable_ramdisk }}" `
-            -ReclaimDisk "${{ inputs.reclaim_disk }}" `
-            -StartupUrl "${{ inputs.startup_url }}" `
-            -Notify "${{ inputs.notify }}"
+        run: pwsh -NoProfile -File .github/scripts/Fabric.ps1 -Mode full
 
       - name: Teardown
         if: always()
