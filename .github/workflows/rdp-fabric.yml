@@ -3,6 +3,8 @@ name: "RDP Fabric Pro"
 # V9.3 — audit pass 1+6: NO dispatch input is interpolated into shell/pwsh code.
 # Everything flows through env vars; the engine validates them.
 # runner_image is validated in the orchestrate job before runs-on ever asks.
+# v9.3.1: runs-on uses the validated output directly (fromJSON is for matrices,
+# not plain strings).
 
 on:
   workflow_dispatch:
@@ -112,7 +114,7 @@ jobs:
 
   fabric:
     needs: orchestrate
-    runs-on: ${{ fromJSON(needs.orchestrate.outputs.runner) }}
+    runs-on: ${{ needs.orchestrate.outputs.runner }}
     timeout-minutes: ${{ fromJSON(needs.orchestrate.outputs.timeout) }}
     strategy:
       matrix: ${{ fromJson(needs.orchestrate.outputs.matrix) }}
