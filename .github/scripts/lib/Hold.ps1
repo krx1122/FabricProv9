@@ -1,11 +1,12 @@
 # lib/Hold.ps1 — Phase 4: quiet hold until the deadline.
 #   every 30s:  Tailscale Running? else re-up.  3389 LISTEN? else re-assert
-#               the SCOPED rules (never the built-in group).
+#               the SCOPED rules (never the built-in group) AND VERIFY them.
 #   every 60s:  heartbeat log line.
-#   every 10m:  MOTW strip on Drop only + state refresh (keeps failure alerts
-#               complete).
+#   every 10m:  MOTW strip (Drop only), state refresh, Tailscale PATH re-check.
 #   never:      EmptyWorkingSet on a 16 GB box; Enable-NetFirewallRule on the
 #               "Remote Desktop" group; logging off the console session.
+# v9.3 (audit fix 7): repair is verified, not assumed — firewall_verified is
+# written to state every cycle.
 
 function Invoke-FabricMotwSweep {
     param([pscustomobject]$Cfg)
@@ -19,10 +20,11 @@ function Invoke-FabricMotwSweep {
 function Invoke-FabricHold {
     param([pscustomobject]$Cfg)
     Write-FabricStep "Phase 4: hold until deadline"
-    Write-FabricLog $Cfg "Holding $($Cfg.RuntimeMinutes) min (watchdog 30s, MOTW 10m Drop-only)."
+    Write-FabricLog $Cfg "Holding $($Cfg.RuntimeMinutes) min (watchdog 30s, MOTW 10m Drop-only, TS path live)."
 
     $gov = Join-Path $Cfg.ScriptsDir 'session\Governor.ps1'
     $tick = 0
+    $lastPath = ''
     while ($Cfg.Deadline -and (Get-Date) -lt $Cfg.Deadline) {
         Start-Sleep -Seconds 30
         $tick++
@@ -40,12 +42,18 @@ function Invoke-FabricHold {
             }
         }
 
-        # ── RDP listener ──
+        # ── RDP listener + VERIFIED firewall scope ──
         $rdpOk = [bool](Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue)
         if (-not $rdpOk) {
             Set-FabricReg $Cfg "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" "fDenyTSConnections" 0 -Important
             Set-FabricRdpFirewall $Cfg
-            Write-FabricLog $Cfg "RDP listener re-armed (scoped rules re-asserted)."
+            if (Test-FabricRdpFirewall $Cfg) {
+                Write-FabricLog $Cfg "RDP listener re-armed (firewall scope verified)."
+                Save-FabricState $Cfg ([ordered]@{ firewall_verified = $true })
+            } else {
+                Write-FabricLog $Cfg "RDP listener re-arm FAILED verification — firewall scope unknown."
+                Save-FabricState $Cfg ([ordered]@{ firewall_verified = $false })
+            }
         }
 
         # ── heartbeat log every 60s ──
@@ -54,9 +62,26 @@ function Invoke-FabricHold {
                 $Cfg.TsHostname, $(if ($tsOk) {'ok'} else {'recovering'}), $(if ($rdpOk) {'ok'} else {'recovering'}), (Get-FreeMemMB), $left)
         }
 
-        # ── every 10 min: MOTW (Drop only) + state refresh + governor (big nodes) ──
+        # ── every 10 min: MOTW + state + live path/compression recheck ──
         if (($tick % 20) -eq 0) {
             if ($Cfg.Mode -eq 'full' -and $Cfg.DataRoot) { Invoke-FabricMotwSweep $Cfg }
+
+            $nowPath = Get-FabricTailscalePath $Cfg
+            if ($nowPath -and $nowPath -ne $lastPath) {
+                $Cfg.TsDirect = ($nowPath -eq 'direct')
+                $compNow = Set-FabricRdpPictureQuality $Cfg ($nowPath -eq 'DERP relay')
+                if ($lastPath) {
+                    Write-FabricLog $Cfg "TS path change: $lastPath → $nowPath (compression $(if ($compNow) {'on'} else {'off'}))."
+                } else {
+                    Write-FabricLog $Cfg "TS path confirmed: $nowPath (compression $(if ($compNow) {'on'} else {'off'}))."
+                }
+                Save-FabricState $Cfg ([ordered]@{
+                    path=$nowPath; ts_direct=$Cfg.TsDirect
+                    rdp_compression_effective=$(if ($compNow) {'on'} else {'off'})
+                })
+                $lastPath = $nowPath
+            }
+
             try {
                 $cFree = [math]::Round(((Get-Volume -DriveLetter $env:SystemDrive.TrimEnd(':') -ErrorAction SilentlyContinue).SizeRemaining / 1GB), 1)
                 $dFree = 0
