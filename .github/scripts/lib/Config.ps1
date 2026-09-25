@@ -1,6 +1,6 @@
 # lib/Config.ps1 — config resolver, logging, merge-only state, shared helpers.
 # One $cfg object is built here and passed into every phase.
-# v9.1: Version bump, state JSON depth 6 (S6).
+# v9.3: audit pass — strict input validation (enum/URL/user/hash), version 9.3.
 
 function ConvertTo-FabricBool {
     param([string]$v)
@@ -14,6 +14,21 @@ function Resolve-FabricValue {
     if (-not [string]::IsNullOrWhiteSpace($e))         { return $e.Trim() }
     if (-not [string]::IsNullOrWhiteSpace($ParamValue)) { return $ParamValue.Trim() }
     return $Default
+}
+
+# Audit fix 6: startup_url is untrusted. HTTPS only, no credentials in the
+# URL, no control characters. Anything else is rejected with a warning.
+function Test-FabricUrl {
+    param([string]$Url)
+    if ([string]::IsNullOrWhiteSpace($Url)) { return '' }
+    $u = $Url.Trim()
+    if ($u -match '[\x00-\x1F\x7F"''<> ]') { Write-Warning "startup_url rejected (control/space/quote chars)."; return '' }
+    $parsed = $null
+    try { $parsed = [uri]$u } catch { Write-Warning "startup_url rejected (unparseable)."; return '' }
+    if ($parsed.Scheme -ne 'https') { Write-Warning "startup_url rejected (HTTPS only)."; return '' }
+    if ($parsed.UserInfo)           { Write-Warning "startup_url rejected (credentials in URL)."; return '' }
+    if (-not $parsed.Host)          { Write-Warning "startup_url rejected (no host)."; return '' }
+    return $u
 }
 
 function Resolve-FabricConfig {
@@ -42,11 +57,20 @@ function Resolve-FabricConfig {
     if ($comp -notin @('auto','on','off')) { $comp = 'auto' }
 
     $tsv = Resolve-FabricValue 'FAB_TS_VERSION' $TailscaleVersion '1.102.3'
+    if ($tsv -notmatch '^\d+\.\d+\.\d+$') { Write-Warning "FAB_TS_VERSION malformed — using 1.102.3."; $tsv = '1.102.3' }
     $root = Resolve-FabricValue 'FABRIC_ROOT' '' 'C:\ProgramData\RDPFabric'
+
+    $sha = [Environment]::GetEnvironmentVariable('FAB_TS_SHA256')
+    if ($sha) { $sha = $sha.Trim(); if ($sha -notmatch '^[0-9a-fA-F]{64}$') { Write-Warning "FAB_TS_SHA256 malformed — ignored."; $sha = $null } }
+
+    $url = Test-FabricUrl (Resolve-FabricValue 'FAB_STARTUP_URL' $StartupUrl '')
+
+    $user = Resolve-FabricValue 'RDP_USER' '' 'FabricAdmin'
+    if ($user -notmatch '^[A-Za-z0-9_.-]{1,20}$') { Write-Warning "RDP_USER malformed — using FabricAdmin."; $user = 'FabricAdmin' }
 
     [pscustomobject]@{
         # ── contract ──
-        Version         = '9.1'
+        Version         = '9.3'
         Mode            = $modeRaw
         RuntimeMinutes  = $rt
         JobTimeoutMin   = [math]::Min(360, $rt + 15)
@@ -55,9 +79,11 @@ function Resolve-FabricConfig {
         RamdiskRequested= (ConvertTo-FabricBool (Resolve-FabricValue 'FAB_RAMDISK' $EnableRamdisk 'false'))
         RdpCompression  = $comp
         ReclaimDisk     = (ConvertTo-FabricBool (Resolve-FabricValue 'FAB_RECLAIM' $ReclaimDisk 'true'))
-        StartupUrl      = (Resolve-FabricValue 'FAB_STARTUP_URL' $StartupUrl '')
+        StartupUrl      = $url
         Notify          = (ConvertTo-FabricBool (Resolve-FabricValue 'FAB_NOTIFY' $Notify 'false'))
-        User            = (Resolve-FabricValue 'RDP_USER' '' 'FabricAdmin')
+        # Audit fix 2: lockdown = keep Defender/SmartScreen/UAC/exec policy.
+        Lockdown        = (ConvertTo-FabricBool (Resolve-FabricValue 'FAB_LOCKDOWN' '' 'false'))
+        User            = $user
         FabricRoot      = $root
         DataRoot        = $null
         Image           = $null
@@ -78,7 +104,7 @@ function Resolve-FabricConfig {
         HasRealGpu      = $false
         # ── Tailscale ──
         TsVersion       = $tsv
-        TsSha256        = [Environment]::GetEnvironmentVariable('FAB_TS_SHA256')
+        TsSha256        = $sha
         TsMsiUrl        = "https://pkgs.tailscale.com/stable/tailscale-setup-$tsv-amd64.msi"
         TsMsiPath       = (Join-Path $root 'cache\tailscale.msi')
         TsPartPath      = (Join-Path $root 'cache\tailscale.msi.part')
@@ -196,6 +222,20 @@ function Ensure-FabricFirewallRule {
     if ($Remote) { $p['RemotePort'] = $Port } else { $p['LocalPort'] = $Port }
     if ($RemoteAddress) { $p['RemoteAddress'] = $RemoteAddress }
     New-NetFirewallRule @p | Out-Null
+}
+
+# Audit fix 7: verify the firewall is actually tailnet-scoped — used after
+# every repair so the hold loop can't claim recovery it didn't achieve.
+function Test-FabricRdpFirewall {
+    param([pscustomobject]$Cfg)
+    $expected = @('100.64.0.0/10','fd7a:115c:a1e0::/48')
+    foreach ($name in @('RDP-TCP-In-Tailscale','RDP-UDP-In-Tailscale')) {
+        $rule = Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue
+        if (-not $rule -or -not $rule.Enabled) { return $false }
+        $addr = @($rule | Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue | Select-Object -Expand RemoteAddress)
+        foreach ($cidr in $expected) { if ($addr -notcontains $cidr) { return $false } }
+    }
+    return $true
 }
 
 # Telegram is opt-in (notify input). Never sends when disabled.
