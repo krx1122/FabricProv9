@@ -1,13 +1,14 @@
 # lib/Config.ps1 — config resolver, logging, merge-only state, shared helpers.
 # One $cfg object is built here and passed into every phase.
 # v9.3: audit pass — strict input validation (enum/URL/user/hash), version 9.3.
+# v9.3.1: firewall create/verify is observable (delete+recreate with real
+# errors; verification returns a reason string, not a blind boolean).
 
 function ConvertTo-FabricBool {
     param([string]$v)
     return (@('true','1','yes','on') -contains "$v".Trim().ToLowerInvariant())
 }
 
-# Resolver rule: FAB_* env (non-empty) → CLI -Param (non-empty) → hard default.
 function Resolve-FabricValue {
     param([string]$EnvName, [string]$ParamValue, [string]$Default)
     $e = [Environment]::GetEnvironmentVariable($EnvName)
@@ -16,8 +17,6 @@ function Resolve-FabricValue {
     return $Default
 }
 
-# Audit fix 6: startup_url is untrusted. HTTPS only, no credentials in the
-# URL, no control characters. Anything else is rejected with a warning.
 function Test-FabricUrl {
     param([string]$Url)
     if ([string]::IsNullOrWhiteSpace($Url)) { return '' }
@@ -69,25 +68,22 @@ function Resolve-FabricConfig {
     if ($user -notmatch '^[A-Za-z0-9_.-]{1,20}$') { Write-Warning "RDP_USER malformed — using FabricAdmin."; $user = 'FabricAdmin' }
 
     [pscustomobject]@{
-        # ── contract ──
         Version         = '9.3'
         Mode            = $modeRaw
         RuntimeMinutes  = $rt
         JobTimeoutMin   = [math]::Min(360, $rt + 15)
-        Profile         = $profile          # 'auto' is resolved in Inventory
-        Ramdisk         = $false            # finalized in Inventory (needs RAM)
+        Profile         = $profile
+        Ramdisk         = $false
         RamdiskRequested= (ConvertTo-FabricBool (Resolve-FabricValue 'FAB_RAMDISK' $EnableRamdisk 'false'))
         RdpCompression  = $comp
         ReclaimDisk     = (ConvertTo-FabricBool (Resolve-FabricValue 'FAB_RECLAIM' $ReclaimDisk 'true'))
         StartupUrl      = $url
         Notify          = (ConvertTo-FabricBool (Resolve-FabricValue 'FAB_NOTIFY' $Notify 'false'))
-        # Audit fix 2: lockdown = keep Defender/SmartScreen/UAC/exec policy.
         Lockdown        = (ConvertTo-FabricBool (Resolve-FabricValue 'FAB_LOCKDOWN' '' 'false'))
         User            = $user
         FabricRoot      = $root
         DataRoot        = $null
         Image           = $null
-        # ── measured in Inventory ──
         QuickTest       = $qt
         Deadline        = $null
         RamGB           = 0.0
@@ -102,7 +98,6 @@ function Resolve-FabricConfig {
         CFreeGB         = 0.0
         DFreeGB         = 0.0
         HasRealGpu      = $false
-        # ── Tailscale ──
         TsVersion       = $tsv
         TsSha256        = $sha
         TsMsiUrl        = "https://pkgs.tailscale.com/stable/tailscale-setup-$tsv-amd64.msi"
@@ -113,13 +108,11 @@ function Resolve-FabricConfig {
         TsHostname      = $null
         TsIp            = ''
         TsDirect        = $false
-        # ── bookkeeping ──
         FailCount       = 0
         LogReady        = $false
     }
 }
 
-# ── logging ──────────────────────────────────────────────────────────────────
 function Write-FabricStep { param([string]$m) Write-Host "── $m" -ForegroundColor Cyan }
 
 function Write-FabricLog {
@@ -133,7 +126,6 @@ function Write-FabricLog {
     Write-Host $m
 }
 
-# ── state (merge-only — a save never drops another phase's fields) ───────────
 function Get-FabricState {
     param([pscustomobject]$Cfg)
     $f = Join-Path $Cfg.FabricRoot 'state.json'
@@ -153,7 +145,6 @@ function Save-FabricState {
     ($merged | ConvertTo-Json -Depth 6) | Set-Content -Path (Join-Path $Cfg.FabricRoot 'state.json') -Encoding UTF8
 }
 
-# ── registry helper (ensures key, consistent error accounting) ───────────────
 function Set-FabricReg {
     param(
         [pscustomobject]$Cfg,
@@ -172,7 +163,6 @@ function Set-FabricReg {
     }
 }
 
-# ── phase runner (fatal vs best-effort declared in Fabric.ps1) ───────────────
 function Invoke-FabricPhase {
     param([pscustomobject]$Cfg, [string]$Name, [scriptblock]$Block, [switch]$Fatal)
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -188,7 +178,6 @@ function Invoke-FabricPhase {
     }
 }
 
-# ── misc shared ──────────────────────────────────────────────────────────────
 function Get-FreeMemMB {
     return [int]((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1KB)
 }
@@ -199,9 +188,10 @@ function Test-FabricFile {
     return ($fi -and $fi.Length -ge $MinBytes)
 }
 
-# Idempotent firewall rule; re-asserts scope on an existing rule.
-function Ensure-FabricFirewallRule {
+# ── Firewall (v9.3.1): delete-then-create (idempotent) with REAL errors ──────
+function Set-FabricFirewallRule {
     param(
+        [pscustomobject]$Cfg,
         [Parameter(Mandatory)][string]$DisplayName,
         [string]$Direction = 'Inbound',
         [string]$Protocol = 'TCP',
@@ -209,36 +199,45 @@ function Ensure-FabricFirewallRule {
         [string[]]$RemoteAddress,
         [switch]$Remote
     )
-    $rule = Get-NetFirewallRule -DisplayName $DisplayName -ErrorAction SilentlyContinue
-    if ($rule) {
-        if ($RemoteAddress) {
-            try { $rule | Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue |
-                    Set-NetFirewallAddressFilter -RemoteAddress $RemoteAddress -ErrorAction SilentlyContinue } catch {}
-        }
-        if (-not $rule.Enabled) { Enable-NetFirewallRule -DisplayName $DisplayName -ErrorAction SilentlyContinue }
-        return
-    }
-    $p = @{ DisplayName=$DisplayName; Direction=$Direction; Protocol=$Protocol; Action='Allow'; ErrorAction='SilentlyContinue' }
+    Get-NetFirewallRule -DisplayName $DisplayName -ErrorAction SilentlyContinue |
+        Remove-NetFirewallRule -ErrorAction SilentlyContinue
+    $p = @{ DisplayName=$DisplayName; Direction=$Direction; Protocol=$Protocol; Action='Allow' }
     if ($Remote) { $p['RemotePort'] = $Port } else { $p['LocalPort'] = $Port }
     if ($RemoteAddress) { $p['RemoteAddress'] = $RemoteAddress }
-    New-NetFirewallRule @p | Out-Null
+    try {
+        New-NetFirewallRule @p -ErrorAction Stop | Out-Null
+    } catch {
+        $Cfg.FailCount++
+        throw "Failed to create firewall rule '$DisplayName' ($Direction/$Protocol/$Port): $($_.Exception.Message)"
+    }
 }
 
-# Audit fix 7: verify the firewall is actually tailnet-scoped — used after
-# every repair so the hold loop can't claim recovery it didn't achieve.
+# Verification that tells you WHY it failed (logged, not just thrown blind).
 function Test-FabricRdpFirewall {
-    param([pscustomobject]$Cfg)
+    param([pscustomobject]$Cfg, [ref]$Reason)
+    $Reason.Value = 'ok'
     $expected = @('100.64.0.0/10','fd7a:115c:a1e0::/48')
     foreach ($name in @('RDP-TCP-In-Tailscale','RDP-UDP-In-Tailscale')) {
         $rule = Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue
-        if (-not $rule -or -not $rule.Enabled) { return $false }
-        $addr = @($rule | Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue | Select-Object -Expand RemoteAddress)
-        foreach ($cidr in $expected) { if ($addr -notcontains $cidr) { return $false } }
+        if (-not $rule) { $Reason.Value = "missing rule '$name'"; return $false }
+        if (-not $rule.Enabled) { $Reason.Value = "rule '$name' disabled"; return $false }
+        $addr = @($rule | Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue | Select-Object -ExpandProperty RemoteAddress)
+        foreach ($cidr in $expected) {
+            if (-not ($addr | Where-Object { $_.Trim() -ieq $cidr })) {
+                $Reason.Value = "rule '$name' missing scope $cidr (has: $($addr -join ', '))"
+                return $false
+            }
+        }
+    }
+    # The built-in any/any group must stay disabled.
+    $group = @(Get-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue | Where-Object Enabled -eq $true)
+    if ($group.Count -gt 0) {
+        $Reason.Value = "built-in 'Remote Desktop' group re-enabled ($($group[0].DisplayName))"
+        return $false
     }
     return $true
 }
 
-# Telegram is opt-in (notify input). Never sends when disabled.
 function Send-FabricNotify {
     param([pscustomobject]$Cfg, [string]$Html)
     if (-not $Cfg.Notify) { return }
