@@ -1,142 +1,117 @@
-# lib/Tailscale.ps1 — Phase 2 (fatal).
-# v9.1: M1 (Start-Process ArgumentList arrays take raw paths), S8 (--reset
-# only on github-hosted), S2 (honest path detection: Self.Relay proves DERP,
-# an active peer with CurAddr proves direct — otherwise 'unknown', and
-# compression stays on until direct is proven).
+# lib/Disk.ps1 — Phase 1d (best-effort, full only).
+# v9.3 (audit fix 5): scratch env vars are set in the CURRENT process first,
+# then persisted at Machine scope — later phases (runtimes, downloads) actually
+# inherit them this run.
 
-function Invoke-FabricTailscale {
+function Invoke-FabricDisk {
     param([pscustomobject]$Cfg)
-    Write-FabricStep "Phase 2: Tailscale mesh"
+    Write-FabricStep "Phase 1d: disk reclaim, pagefile, scratch layout"
 
-    $msi  = $Cfg.TsMsiPath
-    $part = $Cfg.TsPartPath
-
-    # ── settle the background download started in Phase 0 (cap ~40s) ──
-    if ($Cfg.TsDlProc) {
-        $waited = 0
-        while (-not $Cfg.TsDlProc.HasExited -and $waited -lt 40) { Start-Sleep -Seconds 1; $waited++ }
-        if (-not $Cfg.TsDlProc.HasExited) { try { $Cfg.TsDlProc.Kill() } catch {} }
-        if (Test-FabricFile $part 1MB) { Move-Item -LiteralPath $part -Destination $msi -Force }
+    if ($Cfg.ReclaimDisk) {
+        @("$env:SystemRoot\Temp\*", "$env:SystemRoot\Minidump\*", "$env:SystemDrive\Windows\MEMORY.DMP") |
+            ForEach-Object { Remove-Item -Path $_ -Force -ErrorAction SilentlyContinue }
     }
 
-    # ── synchronous fallback ──
-    if (-not (Test-FabricFile $msi 1MB)) {
-        Write-FabricLog $Cfg "MSI not cached — synchronous fetch ($($Cfg.TsVersion))..."
-        New-Item -ItemType Directory -Path (Split-Path $msi) -Force | Out-Null
-        Remove-Item -LiteralPath $msi -Force -ErrorAction SilentlyContinue
-        $ok = $false
-        for ($i = 0; $i -lt 4 -and -not $ok; $i++) {
-            & curl.exe -sS -L --retry 3 --retry-all-errors -m 300 --connect-timeout 15 -o $part $Cfg.TsMsiUrl
-            if ($LASTEXITCODE -eq 0 -and (Test-FabricFile $part 1MB)) {
-                Move-Item -LiteralPath $part -Destination $msi -Force
-                $ok = $true
-            } else { Start-Sleep -Seconds 3 }
+    foreach ($d in @($Cfg.DataRoot, (Join-Path $Cfg.DataRoot 'Temp'),
+                     (Join-Path $Cfg.DataRoot 'Drop'), (Join-Path $Cfg.DataRoot 'Tools'))) {
+        New-Item -ItemType Directory -Path $d -Force | Out-Null
+    }
+
+    # ── pagefile: prefer the scratch volume ──
+    $vol = Get-Volume -DriveLetter $Cfg.BestLetter -ErrorAction SilentlyContinue
+    $freeGB = if ($vol) { [math]::Round($vol.SizeRemaining / 1GB, 1) } else { 0 }
+    $targetMB = [math]::Min([math]::Floor($Cfg.RamGB * 2 * 1024), 65536)
+    $capMB = [math]::Floor($freeGB * 0.45 * 1024)
+    if ($capMB -gt 0) { $targetMB = [math]::Min($targetMB, $capMB) }
+
+    $pfPath = "$($Cfg.BestLetter):\pagefile.sys"
+    $sysLetter = $env:SystemDrive.TrimEnd(':')
+    try {
+        $mm = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"
+        $existing = @()
+        try { $existing = @((Get-ItemProperty -Path $mm -Name PagingFiles -ErrorAction SilentlyContinue).PagingFiles) } catch {}
+        $hasC = $existing | Where-Object { $_ -match ("^" + [regex]::Escape("${sysLetter}:")) }
+        if (-not $hasC) { $existing = @("${sysLetter}:\pagefile.sys 0 0") + @($existing | Where-Object { $_ -and ($_ -notmatch [regex]::Escape($pfPath)) }) }
+        if ($targetMB -ge 2048 -and $Cfg.BestLetter -ne $sysLetter) {
+            $existing = @($existing | Where-Object { $_ -and ($_ -notmatch [regex]::Escape($pfPath)) }) + @("$pfPath $targetMB $targetMB")
         }
-        Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
-        if (-not $ok) { throw "Tailscale MSI download failed ($($Cfg.TsMsiUrl))." }
-    }
+        Set-ItemProperty -Path $mm -Name "PagingFiles" -Value $existing -Type MultiString -Force
+        Write-FabricLog $Cfg ("Pagefile config: {0}" -f ($existing -join ' | '))
+    } catch { Write-FabricLog $Cfg "Pagefile registry untouched: $($_.Exception.Message)" }
 
-    # ── optional integrity check (repo variable FAB_TS_SHA256) ──
-    if ($Cfg.TsSha256) {
-        $h = (Get-FileHash -LiteralPath $msi -Algorithm SHA256).Hash
-        if ($h -ne $Cfg.TsSha256.ToUpperInvariant()) { throw "Tailscale MSI SHA256 mismatch." }
-        Write-FabricLog $Cfg "MSI SHA256 verified."
-    } else {
-        Write-FabricLog $Cfg "Version pinned to $($Cfg.TsVersion); set repo variable FAB_TS_SHA256 to enforce a hash."
-    }
-
-    # ── install (0/1641/3010 = binary should exist). M1: raw paths in arrays. ──
-    $p = Start-Process msiexec.exe -ArgumentList @('/i', $msi, '/qn', '/norestart') -PassThru -Wait
-    if ($p.ExitCode -notin 0, 1641, 3010) {
-        Write-FabricLog $Cfg "msiexec exit $($p.ExitCode) — retrying once."
-        Start-Sleep -Seconds 5
-        $p = Start-Process msiexec.exe -ArgumentList @('/i', $msi, '/qn', '/norestart') -PassThru -Wait
-    }
-    if (-not (Test-Path -LiteralPath $Cfg.TsExe)) { throw "Tailscale installation failed (msiexec exit $($p.ExitCode))." }
-
-    # ── up (use an EPHEMERAL, TAGGED auth key — a reusable key outlives the VM) ──
-    $parts = @('fab', "$env:RUN_ID", "$env:MATRIX_ID") | Where-Object { $_ -and $_.Trim() }
-    $hn = (($parts -join '-') -replace '[^a-zA-Z0-9-]', '-').Trim('-').ToLowerInvariant()
-    if ($hn.Length -gt 60) { $hn = $hn.Substring(0, 60).Trim('-') }
-    $Cfg.TsHostname = $hn
-    # S8: --reset only on hosted runners — a self-hosted node keeps its identity.
-    $up = @('up', "--authkey=$env:TS_AUTHKEY", "--hostname=$($Cfg.TsHostname)",
-            '--accept-routes=false', '--accept-dns=false', '--unattended')
-    if ($env:RUNNER_ENVIRONMENT -eq 'github-hosted') { $up += '--reset' }
-    & $Cfg.TsExe @up
-
-    $backend = $null
-    for ($i = 0; $i -lt 40; $i++) {
-        try { $backend = (& $Cfg.TsExe status --json 2>$null | ConvertFrom-Json).BackendState } catch {}
-        if ($backend -eq 'Running') { break }
-        Start-Sleep -Seconds 1
-    }
-    if ($backend -ne 'Running') { throw "Tailscale BackendState='$backend' — check the auth key." }
-
-    $ip = ''; $t = 30
-    while ($ip -notmatch '^100\.' -and $t -gt 0) {
-        Start-Sleep -Seconds 1
-        $ip = (& $Cfg.TsExe ip -4 | Out-String).Trim(); $t--
-    }
-    if ($ip -notmatch '^\d{1,3}(\.\d{1,3}){3}$') { throw "Failed to acquire a Tailscale IPv4." }
-    $Cfg.TsIp = $ip
-
-    # ── S2: honest path detection. At provision time no peer is connected yet,
-    # so the honest answer is usually 'unknown' — compression stays ON until a
-    # direct peer path is proven (safe default for DERP, minor cost if direct).
-    $Cfg.TsDirect = $false
-    $pathLabel = 'unknown'
-    $j = $null
-    try { $j = (& $Cfg.TsExe status --json 2>$null | ConvertFrom-Json) } catch {}
-    if ($j -and $j.Self) {
-        if ([string]$j.Self.Relay -ne '') {
-            $pathLabel = 'DERP relay'
-        } else {
-            $peers = @($j.Peer.PSObject.Properties.Value)
-            $directPeer = @($peers | Where-Object { $_.Active -and $_.CurAddr -and -not $_.Relay })
-            if ($directPeer.Count -gt 0) { $Cfg.TsDirect = $true; $pathLabel = 'direct' }
+    if ($targetMB -ge 2048 -and $Cfg.BestLetter -ne $sysLetter) {
+        $job = Start-Job -ScriptBlock {
+            param($mb, $path)
+            $ErrorActionPreference = 'Stop'
+            $cs = Get-CimInstance Win32_ComputerSystem
+            if ($cs.AutomaticManagedPagefile) { Set-CimInstance -InputObject $cs -Property @{ AutomaticManagedPagefile = $false } }
+            $already = Get-CimInstance Win32_PageFileSetting -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq $path }
+            if (-not $already) {
+                New-CimInstance -ClassName Win32_PageFileSetting -Property @{ Name = $path; InitialSize = [int]$mb; MaximumSize = [int]$mb } | Out-Null
+            } else {
+                $already | Set-CimInstance -Property @{ InitialSize = [int]$mb; MaximumSize = [int]$mb }
+            }
+        } -ArgumentList $targetMB, $pfPath
+        if (-not (Wait-Job $job -Timeout 20)) {
+            Stop-Job $job -ErrorAction SilentlyContinue
+            Write-FabricLog $Cfg "Pagefile CIM job timed out (20s) — existing pagefile stays."
         }
+        Remove-Job $job -Force -ErrorAction SilentlyContinue
+    }
+    $pfMb = [int]((Get-CimInstance Win32_PageFileUsage -ErrorAction SilentlyContinue | Measure-Object AllocatedBaseSize -Sum).Sum)
+    Save-FabricState $Cfg ([ordered]@{ pagefile_mb = $pfMb })
+    Write-FabricLog $Cfg "Pagefile actual: ${pfMb} MB this session (target ${targetMB} MB applies fully after a boot that never comes)."
+
+    # ── scratch env: process scope FIRST (this run), then Machine (persist) ──
+    $scratch = Join-Path $Cfg.DataRoot 'Temp'
+    $envMap = [ordered]@{
+        'TEMP'             = $scratch
+        'TMP'              = $scratch
+        'NUGET_PACKAGES'   = (Join-Path $Cfg.DataRoot 'nuget')
+        'PIP_CACHE_DIR'    = (Join-Path $Cfg.DataRoot 'pip-cache')
+        'npm_config_cache' = (Join-Path $Cfg.DataRoot 'npm-cache')
+        'DOTNET_CLI_HOME'  = (Join-Path $Cfg.DataRoot 'dotnet')
+    }
+    foreach ($k in $envMap.Keys) {
+        New-Item -ItemType Directory -Path $envMap[$k] -Force -ErrorAction SilentlyContinue | Out-Null
+        Set-Item -Path "env:$k" -Value $envMap[$k]
+        [Environment]::SetEnvironmentVariable($k, $envMap[$k], 'Machine')
     }
 
-    # ── the TCP knobs that actually matter on this path: MTU + no-delay ──
-    $tsAdapter = Get-NetAdapter | Where-Object { $_.InterfaceDescription -match 'Tailscale' -or $_.Name -match 'Tailscale' } | Select-Object -First 1
-    if ($tsAdapter) {
-        netsh interface ipv4 set subinterface "$($tsAdapter.Name)" mtu=1280 store=persistent | Out-Null
-        $ifKey = Get-ChildItem "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces" -ErrorAction SilentlyContinue |
-            Where-Object { (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).DhcpIPAddress -eq $Cfg.TsIp -or
-                           (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).IPAddress -contains $Cfg.TsIp } |
-            Select-Object -First 1
-        if (-not $ifKey) { $ifKey = Get-Item "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$($tsAdapter.InterfaceGuid)" -ErrorAction SilentlyContinue }
-        if ($ifKey) {
-            Set-FabricReg $Cfg $ifKey.PSPath "TcpAckFrequency" 1
-            Set-FabricReg $Cfg $ifKey.PSPath "TCPNoDelay" 1
-            Set-FabricReg $Cfg $ifKey.PSPath "TcpDelAckTicks" 0
-        }
+    # ── ramdisk: only ever on big self-hosted nodes (never on 16 GB) ──
+    if ($Cfg.Ramdisk) {
+        try {
+            $imdisk = "C:\Program Files\ImDisk\imdisk.exe"
+            if (-not (Test-Path -LiteralPath $imdisk)) {
+                $zip = "$env:TEMP\imdisktk.zip"; $ex = "$env:TEMP\imdisktk"; $ok = $false
+                foreach ($u in @("https://downloads.sourceforge.net/project/imdisk-toolkit/20240113/ImDiskTk-x64.zip","https://sourceforge.net/projects/imdisk-toolkit/files/latest/download")) {
+                    & curl.exe -sS -L --retry 2 -m 240 -o "$zip.part" $u
+                    if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath "$zip.part") -and (Get-Item -LiteralPath "$zip.part").Length -gt 1MB) {
+                        Move-Item -LiteralPath "$zip.part" -Destination $zip -Force; $ok = $true; break
+                    }
+                }
+                if ($ok) {
+                    Expand-Archive -Path $zip -DestinationPath $ex -Force -ErrorAction SilentlyContinue
+                    $setup = Get-ChildItem -Path $ex -Recurse -Include "install.bat" -ErrorAction SilentlyContinue | Select-Object -First 1
+                    if ($setup) { Start-Process -FilePath $setup.FullName -ArgumentList "install" -WorkingDirectory (Split-Path $setup.FullName) -Wait -WindowStyle Hidden }
+                }
+            }
+            if (Test-Path -LiteralPath $imdisk) {
+                $freeMB = [math]::Floor((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1KB)
+                $sizeMB = [math]::Min(4096, [math]::Floor($freeMB * 0.15))
+                if ($sizeMB -ge 1024) {
+                    & $imdisk -a -s ${sizeMB}M -m R: -p "/fs:ntfs /q /y" | Out-Null
+                    if (Test-Path "R:\") {
+                        New-Item -ItemType Directory -Path "R:\Temp" -Force | Out-Null
+                        Set-Item -Path "env:TEMP" -Value 'R:\Temp'
+                        Set-Item -Path "env:TMP" -Value 'R:\Temp'
+                        [Environment]::SetEnvironmentVariable('TEMP', 'R:\Temp', 'Machine')
+                        [Environment]::SetEnvironmentVariable('TMP', 'R:\Temp', 'Machine')
+                        Write-FabricLog $Cfg "RAM disk R: ${sizeMB} MB mounted."
+                    }
+                }
+            }
+        } catch { Write-FabricLog $Cfg "RAM disk skipped: $($_.Exception.Message)" }
     }
-
-    # ── compression: auto = off only when direct is PROVEN ──
-    $wantComp = switch ($Cfg.RdpCompression) {
-        'on'  { $true }
-        'off' { $false }
-        default { -not $Cfg.TsDirect }
-    }
-    $rdpTcp = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
-    Set-FabricReg $Cfg $rdpTcp "fDisableCompression" $(if ($wantComp) {0} else {1}) -Important
-    Set-FabricReg $Cfg $rdpTcp "MaxCompressionLevel" $(if ($wantComp) {2} else {0}) -Important
-
-    Save-FabricState $Cfg ([ordered]@{
-        host=$Cfg.TsHostname; ip=$Cfg.TsIp
-        path=$pathLabel; ts_direct=$Cfg.TsDirect
-        rdp_compression_effective=$(if ($wantComp) {'on'} else {'off'})
-    })
-
-    if ($Cfg.Notify) {
-        $drop = Join-Path $Cfg.DataRoot 'Drop'
-        $msg = "⚡ <b>Fabric Node Online v$($Cfg.Version)</b>`n`n🖥 <b>Host:</b> <code>$($Cfg.TsHostname)</code>`n🌐 <b>IP:</b> <code>$($Cfg.TsIp)</code>`n🔗 <b>Path:</b> <code>$pathLabel</code>`n👤 <b>User:</b> <code>$($Cfg.User)</code>`n🧠 <b>Profile:</b> <code>$($Cfg.Profile)</code>`n⚙️ <b>HW:</b> <code>$($Cfg.Cpu) CPU / $($Cfg.RamGB) GB</code>`n⏳ <b>Duration:</b> <code>$($Cfg.RuntimeMinutes)</code> min`n📁 <b>Drop:</b> <code>$drop</code>"
-        Send-FabricNotify $Cfg $msg
-    }
-
-    Write-Host ("Tailscale online: {0} ({1}) path={2}" -f $Cfg.TsIp, $Cfg.TsHostname, $pathLabel) -ForegroundColor Green
-    Write-FabricLog $Cfg ("CONNECT → {0} user={1} path={2} compression={3} (RDP accepts tailnet only)" -f `
-        $Cfg.TsIp, $Cfg.User, $pathLabel, $(if ($wantComp) {'on'} else {'off'}))
+    Write-FabricLog $Cfg "Scratch layout ready ($($Cfg.DataRoot))."
 }
